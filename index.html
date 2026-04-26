@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Spanishh — flashcards</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0f1115">
+<link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%230f1115'/><text x='50' y='66' font-family='system-ui' font-size='52' font-weight='600' text-anchor='middle' fill='%23ffb86b'>S</text></svg>">
+<style>
+  :root { --bg:#0f1115; --fg:#e8e8ea; --muted:#8b8f99; --accent:#ffb86b; --card:#1a1d24; --border:#262a33; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin:0; height:100%; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro", system-ui, sans-serif;
+         background:var(--bg); color:var(--fg); display:flex; flex-direction:column;
+         min-height:100vh; min-height:100dvh; padding-bottom: env(safe-area-inset-bottom); }
+  header { padding:.85rem 1rem; border-bottom:1px solid var(--border);
+           display:flex; justify-content:space-between; align-items:center;
+           padding-top: calc(.85rem + env(safe-area-inset-top)); }
+  header h1 { margin:0; font-size:1.05rem; font-weight:600; letter-spacing:.02em; }
+  .stats { color:var(--muted); font-size:.78rem; font-variant-numeric:tabular-nums; }
+  .stats span { margin-left:.65rem; }
+  main { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
+         padding:1.25rem 1rem; gap: 1rem; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:14px;
+          width:min(560px, 100%); padding:2rem 1.25rem; text-align:center; min-height:220px;
+          display:flex; flex-direction:column; justify-content:center; gap:.75rem; }
+  .word { font-size: clamp(1.8rem, 7vw, 2.6rem); font-weight:600; word-break:break-word; }
+  .answer { font-size: clamp(1.2rem, 5vw, 1.7rem); color:var(--accent); }
+  .hint { color:var(--muted); font-size:.8rem; }
+  .badge { display:inline-block; align-self:center; font-size:.7rem; letter-spacing:.06em;
+           color:var(--muted); border:1px solid var(--border); border-radius:999px;
+           padding:.15rem .55rem; font-variant-numeric:tabular-nums; }
+  .btns { display:flex; gap:.4rem; flex-wrap:wrap; justify-content:center; width:min(560px, 100%); }
+  button { background:var(--card); color:var(--fg); border:1px solid var(--border);
+           padding:.85rem .9rem; border-radius:10px; cursor:pointer;
+           font-size:.95rem; font-family:inherit; flex:1; min-width:80px;
+           touch-action: manipulation; }
+  button:active { background:#222633; }
+  button.show { background:var(--accent); color:#1a1d24; border-color:var(--accent); flex:1; }
+  .r0 { color:#ff6b6b; } .r1 { color:#f8d36b; } .r2 { color:#7bd88f; } .r3 { color:#6bb7ff; }
+  .empty { text-align:center; color:var(--muted); padding: 1rem; }
+  .empty h2 { color:var(--fg); margin: 0 0 .5rem; }
+  footer { border-top:1px solid var(--border); padding:.6rem .75rem;
+           display:grid; gap:.4rem; grid-template-columns: 1fr 1fr; }
+  footer .row { display:flex; gap:.4rem; grid-column: 1 / -1; }
+  footer input, footer select { background:var(--bg); color:var(--fg); border:1px solid var(--border);
+                 padding:.55rem .65rem; border-radius:8px; font-family:inherit; font-size:.95rem;
+                 min-width: 0; flex:1; }
+  footer #sub { width: 4rem; flex:0 0 4rem; }
+  footer #lvl { flex: 0 0 auto; }
+  footer button#add { flex: 0 0 auto; padding:.55rem 1rem; }
+  kbd { background:var(--bg); border:1px solid var(--border); border-radius:4px; padding:1px 5px; font-size:.7rem; }
+  .toolbar { display:flex; gap:.4rem; padding:0 1rem .5rem; justify-content:flex-end; }
+  .toolbar button { flex: 0 0 auto; padding:.45rem .8rem; font-size:.8rem; min-width: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Spanishh</h1>
+  <div class="stats" id="stats">…</div>
+</header>
+<main id="main"><div class="empty">Loading…</div></main>
+<div class="toolbar">
+  <button id="export" title="export progress">Export</button>
+  <button id="reset" title="reset all progress">Reset</button>
+</div>
+<footer>
+  <div class="row">
+    <input id="sp" placeholder="español" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" list="sp-suggest">
+    <datalist id="sp-suggest"></datalist>
+    <input id="en" placeholder="english" autocomplete="off">
+  </div>
+  <div class="row">
+    <select id="lvl">
+      <option>A1</option><option>A2</option><option>B1</option>
+      <option>B2</option><option>C1</option><option>C2</option>
+    </select>
+    <input id="sub" type="number" min="1" max="99" value="1" inputmode="numeric">
+    <button id="add">Add</button>
+  </div>
+</footer>
+
+<script>
+"use strict";
+
+const KEY = "spanishh_v1";
+const LEVEL_ORDER = {A1:1, A2:2, B1:3, B2:4, C1:5, C2:6};
+
+let state = null;
+let current = null;
+let revealed = false;
+let wordbank = null;       // lazy-loaded array
+let suggestTimer = null;
+
+// --------- state ----------
+
+function nowSec() { return Math.floor(Date.now() / 1000); }
+
+function saveState() {
+  try {
+    localStorage.setItem(KEY, JSON.stringify(state));
+  } catch (e) {
+    alert("Couldn't save progress (storage full?). " + e);
+  }
+}
+
+async function loadState() {
+  const raw = localStorage.getItem(KEY);
+  if (raw) {
+    try { return JSON.parse(raw); }
+    catch (e) { console.warn("corrupt local state, re-bootstrapping", e); }
+  }
+  // First run: try bootstrap.json (snapshot of desktop progress), fall back to seed.json.
+  try {
+    const r = await fetch("bootstrap.json", { cache: "no-cache" });
+    if (r.ok) {
+      const s = await r.json();
+      if (s.cards && s.cards.length) return s;
+    }
+  } catch (e) { /* ignore, try seed */ }
+
+  const r2 = await fetch("seed.json", { cache: "no-cache" });
+  const seed = await r2.json();
+  const cards = seed.map((w, i) => newCard(i + 1, w.spanish, w.english || "", w.level || null, w.sublevel || null));
+  return { next_id: cards.length + 1, cards };
+}
+
+function newCard(id, spanish, english, level, sublevel) {
+  return {
+    id, spanish, english,
+    level: level || null,
+    sublevel: sublevel || null,
+    ease: 2.5, interval_days: 0.0,
+    due_ts: nowSec(), reps: 0, lapses: 0,
+  };
+}
+
+// --------- scheduling ----------
+
+function levelRank(c) {
+  const lvl = LEVEL_ORDER[c.level] || 99;
+  const sub = c.sublevel || 1;
+  return lvl * 1000 + sub;
+}
+
+function pickDue() {
+  const t = nowSec();
+  const due = state.cards.filter(c => c.due_ts <= t && c.reps > 0 && c.english);
+  if (due.length) {
+    due.sort((a, b) => (b.lapses - a.lapses) || (a.due_ts - b.due_ts));
+    return due[0];
+  }
+  const fresh = state.cards.filter(c => c.reps === 0 && c.english);
+  if (fresh.length) {
+    fresh.sort((a, b) => levelRank(a) - levelRank(b) || a.id - b.id);
+    return fresh[0];
+  }
+  return null;
+}
+
+function review(card, rating) {
+  let ease = card.ease;
+  let interval = card.interval_days;
+  if (rating === 0) {
+    card.lapses++;
+    ease = Math.max(1.3, ease - 0.2);
+    interval = 0.007;
+  } else {
+    if (interval < 1) {
+      interval = rating >= 2 ? 1.0 : 0.5;
+    } else {
+      const mult = {1: 1.2, 2: ease, 3: ease * 1.3}[rating];
+      interval *= mult;
+    }
+    const d = {1: -0.15, 2: 0.0, 3: 0.15}[rating];
+    ease = Math.max(1.3, ease + d);
+  }
+  card.ease = Math.round(ease * 1000) / 1000;
+  card.interval_days = Math.round(interval * 1000) / 1000;
+  card.due_ts = nowSec() + Math.floor(interval * 86400);
+  card.reps++;
+}
+
+function computeStats() {
+  const t = nowSec();
+  const active = state.cards.filter(c => c.english);
+  const drafts = state.cards.length - active.length;
+  return {
+    total: active.length,
+    due: active.filter(c => c.due_ts <= t && c.reps > 0).length,
+    learning: active.filter(c => c.interval_days < 1 && c.reps > 0).length,
+    new: active.filter(c => c.reps === 0).length,
+    mature: active.filter(c => c.interval_days >= 21).length,
+    drafts,
+  };
+}
+
+// --------- UI ----------
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+}
+
+function refreshStats() {
+  const s = computeStats();
+  document.getElementById("stats").innerHTML =
+    `<span>due <b>${s.due}</b></span><span>new ${s.new}</span><span>learn ${s.learning}</span><span>mature ${s.mature}</span><span>tot ${s.total}</span>`;
+}
+
+function render() {
+  const m = document.getElementById("main");
+  if (!current) {
+    m.innerHTML = `<div class="empty"><h2>All caught up 🎉</h2><p>No cards due. Add new words below or come back later.</p></div>`;
+    return;
+  }
+  const tag = current.level ? `${current.level}.${current.sublevel || 1}` : "—";
+  if (!revealed) {
+    m.innerHTML = `
+      <div class="card">
+        <div class="badge">${tag}</div>
+        <div class="word">${escapeHtml(current.spanish)}</div>
+      </div>
+      <div class="btns"><button class="show" id="show-btn">Show answer <kbd>enter</kbd></button></div>`;
+    document.getElementById("show-btn").onclick = reveal;
+  } else {
+    m.innerHTML = `
+      <div class="card">
+        <div class="badge">${tag}</div>
+        <div class="word">${escapeHtml(current.spanish)}</div>
+        <div class="answer">${escapeHtml(current.english)}</div>
+        <div class="hint">reps ${current.reps} · ease ${current.ease} · interval ${current.interval_days}d</div>
+      </div>
+      <div class="btns">
+        <button class="r0" data-r="0">Again <kbd>1</kbd></button>
+        <button class="r1" data-r="1">Hard <kbd>2</kbd></button>
+        <button class="r2" data-r="2">Good <kbd>3</kbd></button>
+        <button class="r3" data-r="3">Easy <kbd>4</kbd></button>
+      </div>`;
+    for (const b of m.querySelectorAll("[data-r]")) {
+      b.onclick = () => grade(parseInt(b.dataset.r, 10));
+    }
+  }
+}
+
+function reveal() { revealed = true; render(); }
+
+function grade(rating) {
+  if (!current) return;
+  review(current, rating);
+  saveState();
+  loadNext();
+}
+
+function loadNext() {
+  revealed = false;
+  current = pickDue();
+  render();
+  refreshStats();
+}
+
+function addWord() {
+  const sp = document.getElementById("sp").value.trim();
+  const en = document.getElementById("en").value.trim();
+  const lvl = document.getElementById("lvl").value;
+  const sub = parseInt(document.getElementById("sub").value, 10) || 1;
+  if (!sp || !en) return;
+  const id = state.next_id++;
+  state.cards.push(newCard(id, sp, en, lvl, sub));
+  saveState();
+  document.getElementById("sp").value = "";
+  document.getElementById("en").value = "";
+  document.getElementById("sp").focus();
+  refreshStats();
+  if (!current) loadNext();
+}
+
+// --------- wordbank autocomplete ----------
+
+async function ensureWordbank() {
+  if (wordbank !== null) return wordbank;
+  try {
+    const r = await fetch("wordbank.txt", { cache: "force-cache" });
+    if (!r.ok) { wordbank = []; return wordbank; }
+    const txt = await r.text();
+    wordbank = txt.split("\n").map(s => s.trim()).filter(Boolean);
+  } catch (e) {
+    console.warn("wordbank fetch failed", e);
+    wordbank = [];
+  }
+  return wordbank;
+}
+
+async function suggest(q) {
+  q = q.trim().toLowerCase();
+  if (q.length < 2) return [];
+  const wb = await ensureWordbank();
+  const prefix = [];
+  const contains = [];
+  for (const w of wb) {
+    const lw = w.toLowerCase();
+    if (lw.startsWith(q)) prefix.push(w);
+    else if (lw.includes(q)) contains.push(w);
+    if (prefix.length >= 10) break;
+  }
+  return prefix.length >= 10 ? prefix.slice(0, 10) : prefix.concat(contains).slice(0, 10);
+}
+
+// --------- export / reset ----------
+
+function exportState() {
+  const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `spanishh-${new Date().toISOString().slice(0,10)}.json`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+function resetState() {
+  if (!confirm("Wipe all progress and start fresh? This can't be undone.")) return;
+  localStorage.removeItem(KEY);
+  location.reload();
+}
+
+// --------- bindings ----------
+
+document.getElementById("add").onclick = addWord;
+document.getElementById("export").onclick = exportState;
+document.getElementById("reset").onclick = resetState;
+
+for (const id of ["sp", "en", "sub"]) {
+  document.getElementById(id).addEventListener("keydown", e => {
+    if (e.key === "Enter") { e.preventDefault(); addWord(); }
+  });
+}
+
+document.getElementById("sp").addEventListener("input", e => {
+  const q = e.target.value.trim();
+  clearTimeout(suggestTimer);
+  if (q.length < 2) { document.getElementById("sp-suggest").innerHTML = ""; return; }
+  suggestTimer = setTimeout(async () => {
+    const matches = await suggest(q);
+    document.getElementById("sp-suggest").innerHTML =
+      matches.map(w => `<option value="${escapeHtml(w)}">`).join("");
+  }, 150);
+});
+
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+  if (!current) return;
+  if (!revealed && (e.key === " " || e.key === "Enter")) { e.preventDefault(); reveal(); return; }
+  if (revealed && ["1","2","3","4"].includes(e.key)) { grade(parseInt(e.key, 10) - 1); }
+});
+
+// --------- boot ----------
+
+(async () => {
+  state = await loadState();
+  saveState();
+  loadNext();
+})();
+</script>
+</body>
+</html>
