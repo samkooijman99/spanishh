@@ -16,6 +16,11 @@ DAY = 86400
 LOCK = threading.Lock()
 LEVEL_ORDER = {"A1": 1, "A2": 2, "B1": 3, "B2": 4, "C1": 5, "C2": 6}
 WORDBANK: list[str] = []
+DEFAULT_NEW_PER_DAY = 15
+RELEARN_GAP = 3
+# Ephemeral in-process relearn queue: list of {"id": int, "grades_left": int}.
+# Lost on restart; due_ts on each card is the persistent fallback.
+RELEARN_QUEUE: list[dict] = []
 
 
 def load_wordbank() -> list[str]:
@@ -46,6 +51,57 @@ def now() -> int:
     return int(time.time())
 
 
+def today_key() -> str:
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def yesterday_key() -> str:
+    return time.strftime("%Y-%m-%d", time.localtime(time.time() - DAY))
+
+
+def ensure_state_defaults(state: dict) -> None:
+    """Backfill new fields on existing data.json without disturbing card progress."""
+    if "intro_log" not in state:
+        state["intro_log"] = {}
+    if "config" not in state:
+        state["config"] = {}
+    if not isinstance(state["config"].get("new_per_day"), int):
+        state["config"]["new_per_day"] = DEFAULT_NEW_PER_DAY
+    if "daily_log" not in state:
+        state["daily_log"] = {}
+    if "streak" not in state:
+        state["streak"] = {"last_date": None, "days": 0}
+
+
+def today_log(state: dict) -> dict:
+    k = today_key()
+    if k not in state["daily_log"]:
+        state["daily_log"][k] = {"reviews": 0, "mastered": 0}
+    return state["daily_log"][k]
+
+
+def new_intros_today(state: dict) -> int:
+    return state.get("intro_log", {}).get(today_key(), 0)
+
+
+def new_per_day(state: dict) -> int:
+    return state.get("config", {}).get("new_per_day", DEFAULT_NEW_PER_DAY)
+
+
+def bump_streak(state: dict) -> bool:
+    """Update day-streak; returns True if today is the first review of a new day."""
+    today = today_key()
+    s = state["streak"]
+    if s["last_date"] == today:
+        return False
+    if s["last_date"] == yesterday_key():
+        s["days"] += 1
+    else:
+        s["days"] = 1
+    s["last_date"] = today
+    return True
+
+
 def load_state() -> dict:
     seed = []
     if os.path.exists(SEED_PATH):
@@ -55,6 +111,7 @@ def load_state() -> dict:
     if os.path.exists(DATA_PATH):
         with open(DATA_PATH, "r", encoding="utf-8") as f:
             state = json.load(f)
+        ensure_state_defaults(state)
         # Merge: pull in any seed word not yet in data.json (preserve progress);
         # also fill in english/level for existing drafts when seed now has them.
         by_sp = {c["spanish"].lower(): c for c in state["cards"]}
@@ -82,7 +139,9 @@ def load_state() -> dict:
             i + 1, w["spanish"], w.get("english") or "",
             w.get("level"), w.get("sublevel"),
         ))
-    return {"next_id": len(cards) + 1, "cards": cards}
+    state = {"next_id": len(cards) + 1, "cards": cards}
+    ensure_state_defaults(state)
+    return state
 
 
 def save_state(state: dict) -> None:
@@ -107,14 +166,17 @@ def new_card(cid: int, spanish: str, english: str, level=None, sublevel=None) ->
     }
 
 
-def review(card: dict, rating: int) -> dict:
-    """SM-2 lite. rating: 0=Again, 1=Hard, 2=Good, 3=Easy."""
+def review(card: dict, rating: int, state: dict) -> dict:
+    """SM-2 lite. rating: 0=Again, 1=Hard, 2=Good, 3=Easy.
+    Returns gamification events: {mastered, streak_bumped, streak_days, new_today, reviews_today, combo}."""
+    was_new = card["reps"] == 0
+    was_mature = card["interval_days"] >= 21
     ease = card["ease"]
     interval = card["interval_days"]
     if rating == 0:
         card["lapses"] += 1
         ease = max(1.3, ease - 0.2)
-        interval = 0.007  # ~10 minutes, retry soon
+        interval = 0.007  # ~10 minutes; in-session relearn queue handles immediate re-show.
     else:
         if interval < 1:
             interval = 1.0 if rating >= 2 else 0.5
@@ -126,21 +188,67 @@ def review(card: dict, rating: int) -> dict:
     card["interval_days"] = round(interval, 3)
     card["due_ts"] = now() + int(interval * DAY)
     card["reps"] += 1
-    return card
+
+    if was_new:
+        k = today_key()
+        state["intro_log"][k] = state["intro_log"].get(k, 0) + 1
+
+    log = today_log(state)
+    log["reviews"] = log.get("reviews", 0) + 1
+    is_mature = card["interval_days"] >= 21
+    if not was_mature and is_mature:
+        log["mastered"] = log.get("mastered", 0) + 1
+
+    streak_bumped = bump_streak(state)
+
+    # Tick down every entry in the in-session relearn queue; re-queue this card if it still needs work.
+    for r in RELEARN_QUEUE:
+        r["grades_left"] -= 1
+    if rating <= 1 and card["interval_days"] < 1:
+        RELEARN_QUEUE.append({"id": card["id"], "grades_left": RELEARN_GAP})
+
+    return {
+        "card": card,
+        "mastered": (not was_mature) and is_mature,
+        "streak_bumped": streak_bumped,
+        "streak_days": state["streak"]["days"],
+        "new_today": new_intros_today(state),
+        "reviews_today": log["reviews"],
+        "was_new": was_new,
+    }
 
 
 def pick_due(state: dict) -> dict | None:
-    """Reviewing cards (already seen, now due) take priority over introducing new ones.
-    New cards are introduced in CEFR order. Cards with empty english are drafts and skipped."""
+    """Order: in-session relearn queue → review-due → new (capped per day)."""
+    # 1. In-session relearn queue: any card whose countdown has elapsed.
+    for i, r in enumerate(RELEARN_QUEUE):
+        if r["grades_left"] <= 0:
+            cid = r["id"]
+            del RELEARN_QUEUE[i]
+            for c in state["cards"]:
+                if c["id"] == cid:
+                    return c
+            break
+    # 2. Standard review-due, skipping cards already pending in the queue.
+    in_queue = {r["id"] for r in RELEARN_QUEUE}
     t = now()
-    review_due = [c for c in state["cards"] if c["due_ts"] <= t and c["reps"] > 0 and c.get("english")]
+    review_due = [c for c in state["cards"]
+                  if c["due_ts"] <= t and c["reps"] > 0 and c.get("english") and c["id"] not in in_queue]
     if review_due:
         review_due.sort(key=lambda c: (-c["lapses"], c["due_ts"]))
         return review_due[0]
-    new_cards = [c for c in state["cards"] if c["reps"] == 0 and c.get("english")]
-    if new_cards:
-        new_cards.sort(key=lambda c: (level_rank(c), c["id"]))
-        return new_cards[0]
+    # 3. New cards, capped per local day so the backlog can drain.
+    if new_intros_today(state) < new_per_day(state):
+        new_cards = [c for c in state["cards"] if c["reps"] == 0 and c.get("english")]
+        if new_cards:
+            new_cards.sort(key=lambda c: (level_rank(c), c["id"]))
+            return new_cards[0]
+    # 4. Fallback: nothing else to show but a relearn entry is still pending — show it now.
+    if RELEARN_QUEUE:
+        cid = RELEARN_QUEUE.pop(0)["id"]
+        for c in state["cards"]:
+            if c["id"] == cid:
+                return c
     return None
 
 
@@ -153,8 +261,16 @@ def stats(state: dict) -> dict:
     learning = sum(1 for c in active if c["interval_days"] < 1 and c["reps"] > 0)
     new = sum(1 for c in active if c["reps"] == 0)
     mature = sum(1 for c in active if c["interval_days"] >= 21)
-    return {"total": len(active), "due": due, "new": new,
-            "learning": learning, "mature": mature, "drafts": drafts}
+    log = state.get("daily_log", {}).get(today_key(), {})
+    return {
+        "total": len(active), "due": due, "new": new,
+        "learning": learning, "mature": mature, "drafts": drafts,
+        "new_today": new_intros_today(state),
+        "new_per_day": new_per_day(state),
+        "reviews_today": log.get("reviews", 0),
+        "mastered_today": log.get("mastered", 0),
+        "streak_days": state.get("streak", {}).get("days", 0),
+    }
 
 
 # ---------- HTTP ----------
@@ -201,6 +317,14 @@ INDEX_HTML = r"""<!doctype html>
   footer #sub { width:4rem; }
   footer button { flex:0; }
   kbd { background:var(--bg); border:1px solid var(--border); border-radius:4px; padding:1px 5px; font-size:.75rem; }
+  .toast { position: fixed; top: 1rem; left: 50%; transform: translate(-50%, -16px);
+           background: var(--accent); color: #1a1d24; padding: .5rem .9rem; border-radius: 999px;
+           font-weight: 600; font-size: .85rem; opacity: 0; pointer-events: none;
+           transition: opacity .25s ease, transform .25s ease; z-index: 100;
+           box-shadow: 0 4px 16px rgba(0,0,0,.45); max-width: 90vw;
+           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+  .streak { color: #ffb86b; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -229,11 +353,38 @@ async function api(path, opts) {
   return r.json();
 }
 
+let lastStats = null;
+
 async function refreshStats() {
   const s = await api('/api/stats');
+  lastStats = s;
+  const streakHtml = s.streak_days >= 2 ? `<span class="streak" title="day streak">🔥 ${s.streak_days}d</span>` : '';
   document.getElementById('stats').innerHTML =
-    `<span>due <b>${s.due}</b></span><span>new ${s.new}</span><span>learning ${s.learning}</span><span>mature ${s.mature}</span><span>total ${s.total}</span><span>drafts ${s.drafts}</span>`;
+    `${streakHtml}<span>due <b>${s.due}</b></span><span>new ${s.new}</span><span>learning ${s.learning}</span><span>mature ${s.mature}</span><span>total ${s.total}</span><span id="today-cap" style="cursor:pointer;text-decoration:underline dotted" title="tap to change daily new-card limit">today ${s.new_today}/${s.new_per_day}</span>`;
+  document.getElementById('today-cap').onclick = editDailyCap;
 }
+
+async function editDailyCap() {
+  const cur = lastStats ? lastStats.new_per_day : 15;
+  const v = prompt(`New cards per day (currently ${cur}). Use a high number like 999 for unlimited.`, String(cur));
+  if (v === null) return;
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n) || n < 0) return;
+  await api('/api/config', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({new_per_day: n})});
+  refreshStats();
+  if (!current) loadNext();
+}
+
+function toast(html, ms=2200) {
+  const t = document.createElement('div');
+  t.className = 'toast';
+  t.innerHTML = html;
+  document.body.appendChild(t);
+  requestAnimationFrame(() => t.classList.add('show'));
+  setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 300); }, ms);
+}
+
+let sessionCombo = 0;
 
 async function loadNext() {
   revealed = false;
@@ -246,7 +397,15 @@ async function loadNext() {
 function render() {
   const m = document.getElementById('main');
   if (!current) {
-    m.innerHTML = `<div class="empty"><h2>All caught up 🎉</h2><p>No cards due right now. Add new words below or come back later.</p></div>`;
+    const capped = lastStats && lastStats.new > 0 && lastStats.new_today >= lastStats.new_per_day;
+    if (capped) {
+      m.innerHTML = `<div class="empty"><h2>Daily new-card limit reached</h2>
+        <p>${lastStats.new_today} new cards introduced today (cap ${lastStats.new_per_day}).
+        ${lastStats.new} new cards still in the deck. Reviews are caught up.</p>
+        <div class="btns" style="margin-top:1rem"><button onclick="loadMore()">+10 more today</button><button onclick="editDailyCap()">Change cap…</button></div></div>`;
+    } else {
+      m.innerHTML = `<div class="empty"><h2>All caught up 🎉</h2><p>No cards due right now. Add new words below or come back later.</p></div>`;
+    }
     return;
   }
   const tag = current.level ? `${current.level}.${current.sublevel || 1}` : '—';
@@ -276,12 +435,31 @@ function render() {
 
 function reveal() { revealed = true; render(); }
 
+async function loadMore() {
+  await api('/api/relax_cap', {method: 'POST', headers: {'content-type':'application/json'}, body: '{}'});
+  loadNext();
+}
+
 async function grade(rating) {
   if (!current) return;
-  await api('/api/review', {
+  const word = current.spanish;
+  const r = await api('/api/review', {
     method: 'POST', headers: {'content-type':'application/json'},
     body: JSON.stringify({id: current.id, rating}),
   });
+  sessionCombo = rating >= 2 ? sessionCombo + 1 : 0;
+  // Toast cascade — only one popup per grade, prioritized.
+  if (r.mastered) {
+    toast(`🌟 Mastered: ${escapeHtml(word)}`);
+  } else if (r.streak_bumped && r.streak_days >= 2) {
+    toast(`🔥 Day ${r.streak_days} streak!`);
+  } else if (r.was_new && r.new_today > 0 && r.new_today % 5 === 0) {
+    toast(`🌱 ${r.new_today} new words today!`);
+  } else if ([25, 50, 100, 200].includes(r.reviews_today)) {
+    toast(`⚡ ${r.reviews_today} reviews today!`);
+  } else if ([5, 10, 20, 50].includes(sessionCombo)) {
+    toast(`💫 ${sessionCombo}× combo!`);
+  }
   loadNext();
 }
 
@@ -394,11 +572,32 @@ class Handler(BaseHTTPRequestHandler):
                 state = load_state()
                 for c in state["cards"]:
                     if c["id"] == cid:
-                        review(c, rating)
+                        events = review(c, rating, state)
                         save_state(state)
-                        self._send_json({"ok": True, "card": c})
+                        self._send_json({"ok": True, **events})
                         return
             self._send_json({"error": "not found"}, 404)
+            return
+        if self.path == "/api/config":
+            data = self._read_json()
+            n = data.get("new_per_day")
+            if not isinstance(n, int) or n < 0:
+                self._send_json({"error": "bad new_per_day"}, 400)
+                return
+            with LOCK:
+                state = load_state()
+                state["config"]["new_per_day"] = n
+                save_state(state)
+            self._send_json({"ok": True, "new_per_day": n})
+            return
+        if self.path == "/api/relax_cap":
+            # Lets the user "load 10 more today" without permanently raising the daily cap.
+            with LOCK:
+                state = load_state()
+                k = today_key()
+                state["intro_log"][k] = max(0, state["intro_log"].get(k, 0) - 10)
+                save_state(state)
+            self._send_json({"ok": True, "new_today": new_intros_today(state)})
             return
         if self.path == "/api/add":
             data = self._read_json()

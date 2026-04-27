@@ -54,6 +54,15 @@
   kbd { background:var(--bg); border:1px solid var(--border); border-radius:4px; padding:1px 5px; font-size:.7rem; }
   .toolbar { display:flex; gap:.4rem; padding:0 1rem .5rem; justify-content:flex-end; }
   .toolbar button { flex: 0 0 auto; padding:.45rem .8rem; font-size:.8rem; min-width: auto; }
+  .toast { position: fixed; left: 50%; transform: translate(-50%, -16px);
+           top: calc(env(safe-area-inset-top, 0px) + .85rem);
+           background: var(--accent); color: #1a1d24; padding: .5rem .9rem; border-radius: 999px;
+           font-weight: 600; font-size: .85rem; opacity: 0; pointer-events: none;
+           transition: opacity .25s ease, transform .25s ease; z-index: 100;
+           box-shadow: 0 6px 18px rgba(0,0,0,.5); max-width: 90vw;
+           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+  .streak { color: var(--accent); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -87,16 +96,64 @@
 
 const KEY = "spanishh_v1";
 const LEVEL_ORDER = {A1:1, A2:2, B1:3, B2:4, C1:5, C2:6};
+const DEFAULT_NEW_PER_DAY = 15; // can be overridden in state.config.new_per_day (click "today N/M" to change)
+const RELEARN_GAP = 3;          // re-show a failed card after this many other grades
 
 let state = null;
 let current = null;
 let revealed = false;
 let wordbank = null;       // lazy-loaded array
 let suggestTimer = null;
+let relearnQueue = [];     // ephemeral [{id, gradesLeft}], lost on reload (due_ts is the persistent fallback)
+let sessionCombo = 0;      // ephemeral consecutive-good streak (resets on Again or reload)
 
 // --------- state ----------
 
 function nowSec() { return Math.floor(Date.now() / 1000); }
+
+function todayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+}
+
+function yesterdayKey() {
+  const d = new Date(); d.setDate(d.getDate() - 1);
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+}
+
+function newIntrosToday() {
+  return (state.intro_log && state.intro_log[todayKey()]) || 0;
+}
+
+function newPerDay() {
+  return (state.config && state.config.new_per_day) || DEFAULT_NEW_PER_DAY;
+}
+
+function todayLog() {
+  if (!state.daily_log) state.daily_log = {};
+  const k = todayKey();
+  if (!state.daily_log[k]) state.daily_log[k] = { reviews: 0, mastered: 0 };
+  return state.daily_log[k];
+}
+
+function bumpStreak() {
+  if (!state.streak) state.streak = { last_date: null, days: 0 };
+  const today = todayKey();
+  const s = state.streak;
+  if (s.last_date === today) return false;
+  s.days = (s.last_date === yesterdayKey()) ? s.days + 1 : 1;
+  s.last_date = today;
+  return true;
+}
+
+function toast(html, ms = 2200) {
+  const t = document.createElement("div");
+  t.className = "toast";
+  t.innerHTML = html;
+  document.body.appendChild(t);
+  requestAnimationFrame(() => t.classList.add("show"));
+  setTimeout(() => { t.classList.remove("show"); setTimeout(() => t.remove(), 300); }, ms);
+}
 
 function saveState() {
   try {
@@ -109,7 +166,15 @@ function saveState() {
 async function loadState() {
   const raw = localStorage.getItem(KEY);
   if (raw) {
-    try { return JSON.parse(raw); }
+    try {
+      const s = JSON.parse(raw);
+      if (!s.intro_log) s.intro_log = {};
+      if (!s.config) s.config = {};
+      if (typeof s.config.new_per_day !== "number") s.config.new_per_day = DEFAULT_NEW_PER_DAY;
+      if (!s.daily_log) s.daily_log = {};
+      if (!s.streak) s.streak = { last_date: null, days: 0 };
+      return s;
+    }
     catch (e) { console.warn("corrupt local state, re-bootstrapping", e); }
   }
   // First run: try bootstrap.json (snapshot of desktop progress), fall back to seed.json.
@@ -117,14 +182,24 @@ async function loadState() {
     const r = await fetch("bootstrap.json", { cache: "no-cache" });
     if (r.ok) {
       const s = await r.json();
-      if (s.cards && s.cards.length) return s;
+      if (s.cards && s.cards.length) {
+        if (!s.intro_log) s.intro_log = {};
+        if (!s.config) s.config = {};
+        if (typeof s.config.new_per_day !== "number") s.config.new_per_day = DEFAULT_NEW_PER_DAY;
+        return s;
+      }
     }
   } catch (e) { /* ignore, try seed */ }
 
   const r2 = await fetch("seed.json", { cache: "no-cache" });
   const seed = await r2.json();
   const cards = seed.map((w, i) => newCard(i + 1, w.spanish, w.english || "", w.level || null, w.sublevel || null));
-  return { next_id: cards.length + 1, cards };
+  return {
+    next_id: cards.length + 1, cards,
+    intro_log: {}, daily_log: {},
+    config: { new_per_day: DEFAULT_NEW_PER_DAY },
+    streak: { last_date: null, days: 0 },
+  };
 }
 
 function newCard(id, spanish, english, level, sublevel) {
@@ -146,21 +221,43 @@ function levelRank(c) {
 }
 
 function pickDue() {
+  // 1. In-session relearn queue: any card whose countdown has elapsed.
+  for (let i = 0; i < relearnQueue.length; i++) {
+    if (relearnQueue[i].gradesLeft <= 0) {
+      const id = relearnQueue[i].id;
+      relearnQueue.splice(i, 1);
+      const c = state.cards.find(x => x.id === id);
+      if (c) return c;
+    }
+  }
+  // 2. Standard review-due, but skip cards already waiting in the relearn queue.
   const t = nowSec();
-  const due = state.cards.filter(c => c.due_ts <= t && c.reps > 0 && c.english);
+  const inQueue = new Set(relearnQueue.map(r => r.id));
+  const due = state.cards.filter(c => c.due_ts <= t && c.reps > 0 && c.english && !inQueue.has(c.id));
   if (due.length) {
     due.sort((a, b) => (b.lapses - a.lapses) || (a.due_ts - b.due_ts));
     return due[0];
   }
-  const fresh = state.cards.filter(c => c.reps === 0 && c.english);
-  if (fresh.length) {
-    fresh.sort((a, b) => levelRank(a) - levelRank(b) || a.id - b.id);
-    return fresh[0];
+  // 3. New cards, capped per local day so the backlog can drain.
+  if (newIntrosToday() < newPerDay()) {
+    const fresh = state.cards.filter(c => c.reps === 0 && c.english);
+    if (fresh.length) {
+      fresh.sort((a, b) => levelRank(a) - levelRank(b) || a.id - b.id);
+      return fresh[0];
+    }
+  }
+  // 4. Fallback: nothing else to show, but a relearn entry is still pending — show it now
+  //    (otherwise the user sees "caught up" while a card is stuck in the queue).
+  if (relearnQueue.length) {
+    const id = relearnQueue.shift().id;
+    const c = state.cards.find(x => x.id === id);
+    if (c) return c;
   }
   return null;
 }
 
 function review(card, rating) {
+  const wasNew = card.reps === 0;
   let ease = card.ease;
   let interval = card.interval_days;
   if (rating === 0) {
@@ -181,6 +278,17 @@ function review(card, rating) {
   card.interval_days = Math.round(interval * 1000) / 1000;
   card.due_ts = nowSec() + Math.floor(interval * 86400);
   card.reps++;
+
+  if (wasNew) {
+    const k = todayKey();
+    state.intro_log[k] = (state.intro_log[k] || 0) + 1;
+  }
+
+  // Tick down every pending relearn entry; if this card still needs work, re-queue it.
+  for (const r of relearnQueue) r.gradesLeft--;
+  if (rating <= 1 && card.interval_days < 1) {
+    relearnQueue.push({ id: card.id, gradesLeft: RELEARN_GAP });
+  }
 }
 
 function computeStats() {
@@ -206,14 +314,49 @@ function escapeHtml(s) {
 
 function refreshStats() {
   const s = computeStats();
+  const today = newIntrosToday();
+  const cap = newPerDay();
+  const streakDays = (state.streak && state.streak.days) || 0;
+  const streakHtml = streakDays >= 2 ? `<span class="streak" title="day streak">🔥 ${streakDays}d</span>` : "";
   document.getElementById("stats").innerHTML =
-    `<span>due <b>${s.due}</b></span><span>new ${s.new}</span><span>learn ${s.learning}</span><span>mature ${s.mature}</span><span>tot ${s.total}</span>`;
+    `${streakHtml}<span>due <b>${s.due}</b></span><span>new ${s.new}</span><span>learn ${s.learning}</span><span>mature ${s.mature}</span><span>tot ${s.total}</span><span id="today-cap" title="tap to change daily new-card limit" style="cursor:pointer;text-decoration:underline dotted">today ${today}/${cap}</span>`;
+  const el = document.getElementById("today-cap");
+  if (el) el.onclick = editDailyCap;
+}
+
+function editDailyCap() {
+  const cur = newPerDay();
+  const v = prompt(`New cards per day (currently ${cur}). Set to a high number like 999 for unlimited.`, String(cur));
+  if (v === null) return;
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n) || n < 0) return;
+  if (!state.config) state.config = {};
+  state.config.new_per_day = n;
+  saveState();
+  refreshStats();
+  if (!current) loadNext();
 }
 
 function render() {
   const m = document.getElementById("main");
   if (!current) {
-    m.innerHTML = `<div class="empty"><h2>All caught up 🎉</h2><p>No cards due. Add new words below or come back later.</p></div>`;
+    const remainingNew = state.cards.filter(c => c.reps === 0 && c.english).length;
+    const capped = remainingNew > 0 && newIntrosToday() >= newPerDay();
+    if (capped) {
+      m.innerHTML = `<div class="empty"><h2>Daily new-card limit reached</h2>
+        <p>${newIntrosToday()} new cards introduced today (cap ${newPerDay()}).
+        ${remainingNew} new cards still in the deck. Reviews are caught up.</p>
+        <div class="btns" style="margin-top:1rem"><button id="more-btn">+10 more today</button><button id="raise-btn">Change daily cap…</button></div></div>`;
+      document.getElementById("more-btn").onclick = () => {
+        const k = todayKey();
+        state.intro_log[k] = Math.max(0, (state.intro_log[k] || 0) - 10);
+        saveState();
+        loadNext();
+      };
+      document.getElementById("raise-btn").onclick = editDailyCap;
+    } else {
+      m.innerHTML = `<div class="empty"><h2>All caught up 🎉</h2><p>No cards due. Add new words below or come back later.</p></div>`;
+    }
     return;
   }
   const tag = current.level ? `${current.level}.${current.sublevel || 1}` : "—";
@@ -249,8 +392,37 @@ function reveal() { revealed = true; render(); }
 
 function grade(rating) {
   if (!current) return;
+  const word = current.spanish;
+  const wasNew = current.reps === 0;
+  const wasMature = current.interval_days >= 21;
   review(current, rating);
+
+  // Daily log + streak (gamification side-effects, persisted).
+  const log = todayLog();
+  log.reviews = (log.reviews || 0) + 1;
+  const isNowMature = current.interval_days >= 21;
+  const justMastered = !wasMature && isNowMature;
+  if (justMastered) log.mastered = (log.mastered || 0) + 1;
+  const streakBumped = bumpStreak();
+
+  // Combo (in-memory).
+  sessionCombo = rating >= 2 ? sessionCombo + 1 : 0;
+
   saveState();
+
+  // One toast per grade, prioritized so the rarest event wins.
+  if (justMastered) {
+    toast(`🌟 Mastered: ${escapeHtml(word)}`);
+  } else if (streakBumped && state.streak.days >= 2) {
+    toast(`🔥 Day ${state.streak.days} streak!`);
+  } else if (wasNew && newIntrosToday() > 0 && newIntrosToday() % 5 === 0) {
+    toast(`🌱 ${newIntrosToday()} new words today!`);
+  } else if ([25, 50, 100, 200].includes(log.reviews)) {
+    toast(`⚡ ${log.reviews} reviews today!`);
+  } else if ([5, 10, 20, 50].includes(sessionCombo)) {
+    toast(`💫 ${sessionCombo}× combo!`);
+  }
+
   loadNext();
 }
 
