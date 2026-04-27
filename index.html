@@ -63,13 +63,19 @@
            white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .toast.show { opacity: 1; transform: translate(-50%, 0); }
   .streak { color: var(--accent); font-weight: 600; }
+  .langtabs { display:flex; gap:.25rem; padding:.4rem 1rem .55rem; border-bottom:1px solid var(--border);
+              align-items:center; }
+  .langtabs button { flex:0 0 auto; padding:.35rem .85rem; border-radius:999px; font-size:.8rem;
+                     background:transparent; border:1px solid var(--border); color:var(--muted); }
+  .langtabs button.active { background:var(--card); color:var(--fg); border-color:var(--accent); }
 </style>
 </head>
 <body>
 <header>
-  <h1>Spanishh</h1>
+  <h1 id="title">Spanishh</h1>
   <div class="stats" id="stats">…</div>
 </header>
+<div class="langtabs" id="langtabs"></div>
 <main id="main"><div class="empty">Loading…</div></main>
 <div class="toolbar">
   <button id="export" title="export progress">Export</button>
@@ -94,15 +100,27 @@
 <script>
 "use strict";
 
-const KEY = "spanishh_v1";
 const LEVEL_ORDER = {A1:1, A2:2, B1:3, B2:4, C1:5, C2:6};
 const DEFAULT_NEW_PER_DAY = 15; // can be overridden in state.config.new_per_day (click "today N/M" to change)
 const RELEARN_GAP = 3;          // re-show a failed card after this many other grades
 
+// Each language has independent localStorage state, seed file, and stats.
+// Adding a new language: add an entry here + ship the matching seed_<lang>.json.
+const LANGUAGES = {
+  spanish:  { title: "Spanishh",  storageKey: "spanishh_v1",  bootstrap: "bootstrap.json", seed: "seed.json",          inputPlaceholder: "español",  wordbank: "wordbank.txt" },
+  croatian: { title: "Croatianh", storageKey: "croatianh_v1", bootstrap: null,             seed: "seed_croatian.json", inputPlaceholder: "hrvatski", wordbank: null },
+};
+const LANG_PREF_KEY = "spanishh_active_lang";
+let currentLang = (function() {
+  const stored = localStorage.getItem(LANG_PREF_KEY);
+  return (stored && LANGUAGES[stored]) ? stored : "spanish";
+})();
+function langCfg() { return LANGUAGES[currentLang]; }
+
 let state = null;
 let current = null;
 let revealed = false;
-let wordbank = null;       // lazy-loaded array
+let wordbank = null;       // lazy-loaded array (only for langs with a wordbank)
 let suggestTimer = null;
 let relearnQueue = [];     // ephemeral [{id, gradesLeft}], lost on reload (due_ts is the persistent fallback)
 let sessionCombo = 0;      // ephemeral consecutive-good streak (resets on Again or reload)
@@ -157,14 +175,14 @@ function toast(html, ms = 2200) {
 
 function saveState() {
   try {
-    localStorage.setItem(KEY, JSON.stringify(state));
+    localStorage.setItem(langCfg().storageKey, JSON.stringify(state));
   } catch (e) {
     alert("Couldn't save progress (storage full?). " + e);
   }
 }
 
 async function loadState() {
-  const raw = localStorage.getItem(KEY);
+  const raw = localStorage.getItem(langCfg().storageKey);
   if (raw) {
     try {
       const s = JSON.parse(raw);
@@ -177,21 +195,26 @@ async function loadState() {
     }
     catch (e) { console.warn("corrupt local state, re-bootstrapping", e); }
   }
-  // First run: try bootstrap.json (snapshot of desktop progress), fall back to seed.json.
-  try {
-    const r = await fetch("bootstrap.json", { cache: "no-cache" });
-    if (r.ok) {
-      const s = await r.json();
-      if (s.cards && s.cards.length) {
-        if (!s.intro_log) s.intro_log = {};
-        if (!s.config) s.config = {};
-        if (typeof s.config.new_per_day !== "number") s.config.new_per_day = DEFAULT_NEW_PER_DAY;
-        return s;
+  // First run for this language: try bootstrap (if any), then seed.
+  const cfg = langCfg();
+  if (cfg.bootstrap) {
+    try {
+      const r = await fetch(cfg.bootstrap, { cache: "no-cache" });
+      if (r.ok) {
+        const s = await r.json();
+        if (s.cards && s.cards.length) {
+          if (!s.intro_log) s.intro_log = {};
+          if (!s.config) s.config = {};
+          if (typeof s.config.new_per_day !== "number") s.config.new_per_day = DEFAULT_NEW_PER_DAY;
+          if (!s.daily_log) s.daily_log = {};
+          if (!s.streak) s.streak = { last_date: null, days: 0 };
+          return s;
+        }
       }
-    }
-  } catch (e) { /* ignore, try seed */ }
+    } catch (e) { /* ignore, try seed */ }
+  }
 
-  const r2 = await fetch("seed.json", { cache: "no-cache" });
+  const r2 = await fetch(cfg.seed, { cache: "no-cache" });
   const seed = await r2.json();
   const cards = seed.map((w, i) => newCard(i + 1, w.spanish, w.english || "", w.level || null, w.sublevel || null));
   return {
@@ -453,8 +476,10 @@ function addWord() {
 
 async function ensureWordbank() {
   if (wordbank !== null) return wordbank;
+  const path = langCfg().wordbank;
+  if (!path) { wordbank = []; return wordbank; }
   try {
-    const r = await fetch("wordbank.txt", { cache: "force-cache" });
+    const r = await fetch(path, { cache: "force-cache" });
     if (!r.ok) { wordbank = []; return wordbank; }
     const txt = await r.text();
     wordbank = txt.split("\n").map(s => s.trim()).filter(Boolean);
@@ -487,15 +512,47 @@ function exportState() {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `spanishh-${new Date().toISOString().slice(0,10)}.json`;
+  a.download = `${currentLang}h-${new Date().toISOString().slice(0,10)}.json`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
 function resetState() {
-  if (!confirm("Wipe all progress and start fresh? This can't be undone.")) return;
-  localStorage.removeItem(KEY);
+  if (!confirm(`Wipe all ${langCfg().title} progress and start fresh? This can't be undone.`)) return;
+  localStorage.removeItem(langCfg().storageKey);
   location.reload();
+}
+
+// --------- language switching ----------
+
+function applyLangChrome() {
+  document.getElementById("title").textContent = langCfg().title;
+  document.getElementById("sp").placeholder = langCfg().inputPlaceholder;
+  // Render tabs (active state)
+  const bar = document.getElementById("langtabs");
+  bar.innerHTML = Object.entries(LANGUAGES).map(([id, cfg]) =>
+    `<button data-lang="${id}" class="${id === currentLang ? "active" : ""}">${escapeHtml(cfg.title)}</button>`
+  ).join("");
+  for (const b of bar.querySelectorAll("button")) {
+    b.onclick = () => switchLang(b.dataset.lang);
+  }
+}
+
+async function switchLang(lang) {
+  if (lang === currentLang || !LANGUAGES[lang]) return;
+  // Persist current state first (no-op if nothing changed since last save).
+  if (state) saveState();
+  currentLang = lang;
+  localStorage.setItem(LANG_PREF_KEY, lang);
+  // Reset ephemeral session state — these don't transfer across languages.
+  relearnQueue = [];
+  sessionCombo = 0;
+  wordbank = null;
+  document.getElementById("sp-suggest").innerHTML = "";
+  applyLangChrome();
+  state = await loadState();
+  saveState();
+  loadNext();
 }
 
 // --------- bindings ----------
@@ -531,6 +588,7 @@ document.addEventListener("keydown", e => {
 // --------- boot ----------
 
 (async () => {
+  applyLangChrome();
   state = await loadState();
   saveState();
   loadNext();
